@@ -1,0 +1,153 @@
+name: DEPPLOYYYYYYYYYYYYY
+
+on:
+  workflow_dispatch:
+    inputs:
+      worker_name:
+        description: 'Nama Worker'
+        required: true
+        type: string
+      cloudflare_account_id:
+        description: 'Cloudflare Account ID'
+        required: true
+        type: string
+      cloudflare_api_token:
+        description: 'Cloudflare API Token'
+        required: true
+        type: string
+      main_domain:
+        description: 'Main domain for the worker (e.g., nzr2805.my.id)'
+        required: true
+        type: string
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Membuat package.json jika tidak ada
+        id: check_package_json
+        run: |
+          if [ ! -f "package.json" ]; then
+            echo "File package.json tidak ditemukan, membuat file baru..."
+            npm init -y
+            npm install wrangler@latest
+          else
+            echo "File package.json sudah ada."
+          fi
+
+      - name: Dynamic Wrangler.toml from customdomain.txt
+        run: |
+          # Buat header wrangler.toml
+          echo "name = \"${{ inputs.worker_name }}\"" > wrangler.toml
+          echo "main = \"worker.js\"" >> wrangler.toml
+          echo "compatibility_date = \"2024-01-15\"" >> wrangler.toml
+          echo "compatibility_flags = [\"nodejs_compat\"]" >> wrangler.toml
+          echo "workers_dev = true" >> wrangler.toml
+          echo "" >> wrangler.toml
+
+          # Tambahkan Routes
+          echo "routes = [" >> wrangler.toml
+          echo "  { pattern = \"${{ inputs.main_domain }}\", custom_domain = true }," >> wrangler.toml
+
+          # Loop melalui setiap domain dari customdomain.txt, lewati baris kosong
+          while read -r domain; do
+            if [[ -n "$domain" ]]; then
+              echo "  { pattern = \"$domain.${{ inputs.main_domain }}\", custom_domain = true }," >> wrangler.toml
+            fi
+          done < customdomain.txt
+
+          # Hapus koma terakhir dari baris terakhir
+          sed -i '$ s/,$//' wrangler.toml
+
+          # Tutup array routes dan tambahkan konfigurasi tambahan
+          echo "]" >> wrangler.toml
+          echo "" >> wrangler.toml
+
+          echo "[build]" >> wrangler.toml
+          echo "command = \"\"" >> wrangler.toml
+          echo "" >> wrangler.toml
+
+      - name: Display Wrangler.toml for debugging
+        run: |
+          echo "--- Generated wrangler.toml content ---"
+          cat wrangler.toml
+          echo "-------------------------------------"
+
+      # ========== STEP BARU: Membuat DNS A Record dengan IP Custom ==========
+      - name: Create DNS A records for custom domains
+        env:
+          CF_API_TOKEN: ${{ inputs.cloudflare_api_token }}
+          CF_ACCOUNT_ID: ${{ inputs.cloudflare_account_id }}
+          MAIN_DOMAIN: ${{ inputs.main_domain }}
+        run: |
+          # Baca IP dari customip4.txt (ambil baris pertama yang tidak kosong)
+          CUSTOM_IP=$(grep -v '^$' customip4.txt | head -1)
+          if [ -z "$CUSTOM_IP" ]; then
+            echo "ERROR: customip4.txt kosong atau tidak berisi IP"
+            exit 1
+          fi
+          echo "Menggunakan IP: $CUSTOM_IP"
+
+          # Dapatkan Zone ID dari main domain
+          ZONE_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$MAIN_DOMAIN" \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            -H "Content-Type: application/json" | jq -r '.result[0].id')
+
+          if [ -z "$ZONE_ID" ] || [ "$ZONE_ID" = "null" ]; then
+            echo "ERROR: Gagal mendapatkan Zone ID untuk $MAIN_DOMAIN"
+            exit 1
+          fi
+          echo "Zone ID: $ZONE_ID"
+
+          # Loop setiap domain dari customdomain.txt
+          while read -r subdomain; do
+            # Abaikan baris kosong
+            if [ -n "$subdomain" ]; then
+              FULL_DOMAIN="${subdomain}.${MAIN_DOMAIN}"
+              echo "Membuat record A untuk $FULL_DOMAIN -> $CUSTOM_IP"
+
+              # Cek apakah record sudah ada
+              EXISTING=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records?type=A&name=$FULL_DOMAIN" \
+                -H "Authorization: Bearer $CF_API_TOKEN" \
+                -H "Content-Type: application/json")
+
+              RECORD_ID=$(echo "$EXISTING" | jq -r '.result[0].id')
+              if [ "$RECORD_ID" != "null" ] && [ -n "$RECORD_ID" ]; then
+                echo "Record sudah ada (ID: $RECORD_ID). Mengupdate..."
+                # Update record
+                RESPONSE=$(curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$RECORD_ID" \
+                  -H "Authorization: Bearer $CF_API_TOKEN" \
+                  -H "Content-Type: application/json" \
+                  --data "{\"type\":\"A\",\"name\":\"$FULL_DOMAIN\",\"content\":\"$CUSTOM_IP\",\"ttl\":1,\"proxied\":false}")
+              else
+                # Buat record baru
+                RESPONSE=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records" \
+                  -H "Authorization: Bearer $CF_API_TOKEN" \
+                  -H "Content-Type: application/json" \
+                  --data "{\"type\":\"A\",\"name\":\"$FULL_DOMAIN\",\"content\":\"$CUSTOM_IP\",\"ttl\":1,\"proxied\":false}")
+              fi
+
+              SUCCESS=$(echo "$RESPONSE" | jq -r '.success')
+              if [ "$SUCCESS" != "true" ]; then
+                echo "Gagal membuat/update record untuk $FULL_DOMAIN"
+                echo "$RESPONSE" | jq '.'
+              else
+                echo "Berhasil: $FULL_DOMAIN"
+              fi
+            fi
+          done < customdomain.txt
+      # =====================================================================
+
+      - name: Deploy to Cloudflare
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ inputs.cloudflare_api_token }}
+          accountId: ${{ inputs.cloudflare_account_id }}
